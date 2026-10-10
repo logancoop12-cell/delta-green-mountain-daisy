@@ -1,3 +1,5 @@
+import { profileFor } from "./weights";
+
 export const RATING_LABELS = [
   "Strong Sell",
   "Sell",
@@ -15,7 +17,11 @@ export type FactorKey =
   | "netIncomeGrowth"
   | "forwardPeVsIndustry"
   | "shareholderYield"
-  | "fcfYield";
+  | "fcfYield"
+  | "returnOnCapital"
+  | "grossMarginQuality"
+  | "balanceSheet"
+  | "moat";
 
 /** Stated weights. They sum to 1. Missing factors are dropped and the rest rescaled. */
 export const FACTORS: {
@@ -86,17 +92,18 @@ export function clampScore(n: number): number {
 }
 
 /**
- * Relative valuation. 0.50× the median scores 100, 1.00× scores 50, 1.50× scores 0.
+ * Relative valuation. Half the median scores 100, in line scores 75,
+ * 1.5× the median scores 50, and 2.5× scores 0. A modest premium is no longer a zero.
  */
 export function relativeMultipleScore(ratio: number): number {
-  return clampScore((1.5 - ratio) * 100);
+  return clampScore(100 - (ratio - 0.5) * 50);
 }
 
 /**
- * PEG. 0.50 scores 100, 1.50 scores 50, 2.50 scores 0.
+ * PEG. 0.50 scores 100, 2.0 scores about 57, and 4.0 scores 0.
  */
 export function pegScore(peg: number): number {
-  return clampScore(((2.5 - peg) / 2) * 100);
+  return clampScore(100 - (peg - 0.5) * (100 / 3.5));
 }
 
 /**
@@ -121,6 +128,45 @@ export function shareholderYieldScore(yieldDecimal: number): number {
 export function fcfYieldScore(yieldDecimal: number): number {
   if (yieldDecimal >= 0) return clampScore(25 + yieldDecimal * (75 / 0.08));
   return clampScore(25 + yieldDecimal * (25 / 0.08));
+}
+
+/** 0% → 20, 8% → 50, 25% → 100. Works for ROIC and for bank ROE. */
+export function returnScore(rate: number): number {
+  if (rate <= 0) return clampScore(20 + (rate / 0.15) * 20);
+  if (rate <= 0.08) return 20 + (rate / 0.08) * 30;
+  return clampScore(50 + ((rate - 0.08) / 0.17) * 50);
+}
+
+export function marginQualityScore(margins: number[]): { score: number; average: number; spread: number } | null {
+  if (margins.length < 3) return null;
+  const average = margins.reduce((sum, value) => sum + value, 0) / margins.length;
+  const variance = margins.reduce((sum, value) => sum + (value - average) ** 2, 0) / margins.length;
+  const spread = Math.sqrt(variance);
+  const level = clampScore(10 + (average / 0.6) * 90);
+  const stability = clampScore(100 - (spread / 0.12) * 100);
+  const first = margins[0] ?? average;
+  const last = margins[margins.length - 1] ?? average;
+  const trend = last < first - 0.04 ? -12 : 0;
+  return { score: clampScore(level * 0.65 + stability * 0.35 + trend), average, spread };
+}
+
+/** Net cash scores 85–100. Six turns of net debt / EBITDA scores 0. */
+export function leverageScore(netDebtToEbitda: number): number {
+  if (netDebtToEbitda <= 0) return clampScore(85 + Math.min(1, -netDebtToEbitda) * 15);
+  return clampScore(85 - netDebtToEbitda * (85 / 6));
+}
+
+/**
+ * Net debt / EBITDA ranks healthy balance sheets. Altman Z' only caps the score
+ * when it says distress or a grey zone, so mega-cap market values don't all score 100.
+ */
+export function healthScore(netDebtToEbitda: number | null, altmanZ: number | null): number | null {
+  const leverage = netDebtToEbitda == null ? null : leverageScore(netDebtToEbitda);
+  let score = leverage;
+  if (altmanZ != null && altmanZ < 1.1) score = score == null ? 15 : Math.min(score, 25);
+  else if (altmanZ != null && altmanZ < 2.6) score = score == null ? 45 : Math.min(score, 60);
+  else if (score == null && altmanZ != null) score = 70;
+  return score;
 }
 
 export type IncomePoint = { end: string; value: number };
@@ -231,6 +277,18 @@ export type MarketSnapshot = {
   incomeSource: string | null;
   /** Banks and insurers: reported free cash flow is not a shareholder yield. */
   fcfSkipped: boolean;
+  returnOnCapital: number | null;
+  returnKind: "roic" | "roe";
+  returnNote: string | null;
+  grossMargins: number[] | null;
+  netDebtToEbitda: number | null;
+  altmanZ: number | null;
+  retainedEarningsFloored: boolean;
+  moat: {
+    score: number;
+    gap: boolean;
+    sources: { name: string; score: number; href: string; note: string }[];
+  } | null;
   peers: PeerSet | null;
 };
 
@@ -256,6 +314,8 @@ export type RatingReport = {
   marketCap: number | null;
   industry: string | null;
   sector: string | null;
+  profileName: string;
+  profileSummary: string;
   score: number;
   rating: RatingLabel;
   coverage: number;
@@ -318,24 +378,34 @@ function multipleFactor(args: {
     };
   }
   if (multiple <= 0) {
+    if (args.key === "pbVsIndustry") {
+      return {
+        key: args.key,
+        label: args.label,
+        weight: args.weight,
+        score: 0,
+        reading: "Negative book",
+        detail: "Book value is negative, so price-to-book cannot show a discount. This factor scores at the floor.",
+      };
+    }
     return {
       key: args.key,
       label: args.label,
       weight: args.weight,
-      score: 0,
+      score: null,
       reading: "Negative",
-      detail: `${args.multipleName} is negative, so there is no cheap-versus-expensive comparison to make. This factor scores at the floor.`,
+      detail: `${args.multipleName} is negative, so it is left out instead of scoring zero. A company can be investing through losses without being a strong sell on this factor alone.`,
     };
   }
   const mid = median(peers);
-  if (mid == null || peers.length < 5) {
+  if (mid == null || peers.length < 4) {
     return {
       key: args.key,
       label: args.label,
       weight: args.weight,
       score: null,
       reading: multiple.toFixed(1) + "×",
-      detail: `Not enough peer ${args.multipleName} figures to build an industry median (need at least five). This factor is left out.`,
+      detail: `Not enough peer ${args.multipleName} figures to build a median (need at least four). This factor is left out.`,
     };
   }
   const ratio = multiple / mid;
